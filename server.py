@@ -13,6 +13,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 from google.cloud import storage
 from google.oauth2 import service_account
 
@@ -33,8 +34,7 @@ from config import (
 def get_gcs_client() -> storage.Client:
     """
     Retourne un client GCS authentifié.
-    Lit les credentials depuis la variable d'env GCP_CREDENTIALS_JSON
-    (JSON du service account GCP, stringifié en une seule ligne).
+    Lit les credentials depuis la variable d'env GCP_CREDENTIALS_JSON.
     """
     if GCP_CREDENTIALS_JSON:
         info  = json.loads(GCP_CREDENTIALS_JSON)
@@ -56,7 +56,7 @@ mcp = FastMCP(
         "Outil disponible : screenshot_url. "
         "Prend une URL en entrée, capture un screenshot pleine-page via Playwright, "
         "uploade le PNG sur GCP Cloud Storage et retourne l'URL publique de l'image. "
-        "Supporte les pages Dust authentifiées via email + mot de passe."
+        "Supporte les pages Dust authentifiées via email + mot de passe (authenticated=True)."
     )
 )
 
@@ -69,39 +69,45 @@ async def login_to_dust(page) -> None:
     """
     Automatise le login Dust via WorkOS AuthKit.
 
-    Flow en 2 étapes :
-      1. Saisir l'email → cliquer Continue
-      2. Saisir le mot de passe → cliquer Continue
+    Flow :
+      1. dust.tt/api/workos/login → redirige vers signin.dust.tt
+      2. Saisir l'email → cliquer Continuer
+      3. Saisir le mot de passe → cliquer Continuer (1er bouton submit)
+      4. Attendre la redirection vers app.dust.tt
 
-    Après le login, Dust redirige vers le workspace.
-    La session est active dans tout le contexte Playwright.
+    Utilise playwright-stealth pour bypasser la détection bot de WorkOS.
     """
 
-    # Étape 1 : Aller sur la page de login Dust (WorkOS AuthKit)
+    # Étape 1 : Naviguer vers la page de login Dust
+    # WorkOS redirige automatiquement vers signin.dust.tt
     await page.goto(
         "https://dust.tt/api/workos/login?returnTo=%2Fapi%2Flogin",
         wait_until="networkidle",
         timeout=30_000
     )
+    await page.wait_for_url("https://signin.dust.tt/**", timeout=15_000)
 
     # Étape 2 : Saisir l'email
-    await page.wait_for_selector("input[type='email']", timeout=10_000)
-    await page.fill("input[type='email']", DUST_EMAIL)
+    await page.locator("input[name='email']").wait_for(state="visible", timeout=10_000)
+    await page.locator("input[name='email']").fill(DUST_EMAIL)
 
-    # Cliquer sur "Continue" (1er submit → charge le champ password)
-    await page.click("button[type='submit']")
+    # Cliquer sur "Continuer" — .first car il peut y avoir plusieurs boutons submit
+    await page.locator("button[type='submit']").first.click()
+    await page.wait_for_load_state("networkidle")
+    # ^ Après ce clic, WorkOS charge la page mot de passe (signin.dust.tt/password)
 
-    # Étape 3 : Attendre le champ mot de passe (2e étape WorkOS)
-    await page.wait_for_selector("input[type='password']", timeout=10_000)
-    await page.fill("input[type='password']", DUST_PASSWORD)
+    # Étape 3 : Saisir le mot de passe
+    await page.locator("input[name='password']").wait_for(state="visible", timeout=10_000)
+    await page.locator("input[name='password']").fill(DUST_PASSWORD)
 
-    # Cliquer sur "Continue" (2e submit → authentification)
-    await page.click("button[type='submit']")
+    # Cliquer sur "Continuer" — .first pour éviter le bouton passkey
+    await page.locator("button[type='submit']").first.click()
+    await page.wait_for_load_state("networkidle")
 
-    # Étape 4 : Attendre la redirection vers dust.tt
-    # WorkOS redirige vers dust.tt/api/workos/callback puis vers le workspace
-    await page.wait_for_url("https://dust.tt/**", timeout=20_000)
-    # ^ Session active dans le contexte Playwright à partir d'ici
+    # Étape 4 : Attendre la redirection finale vers app.dust.tt
+    # Dust redirige : signin.dust.tt → dust.tt/api/workos/callback → app.dust.tt
+    await page.wait_for_url("https://app.dust.tt/**", timeout=20_000)
+    # ^ Session active dans tout le contexte Playwright à partir d'ici
 
 
 # =============================================================================
@@ -127,63 +133,52 @@ async def screenshot_url(url: str, authenticated: bool = False) -> str:
 
     # ── 1. Nom de fichier unique ──────────────────────────────
     ts        = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    # ^ Timestamp UTC : "20260513_143022"
     uid       = str(uuid.uuid4())[:8]
-    # ^ 8 caractères aléatoires : "a1b2c3d4"
     blob_name = f"screenshots/{ts}_{uid}.png"
-    # ^ Chemin dans le bucket : "screenshots/20260513_143022_a1b2c3d4.png"
 
     # ── 2. Screenshot Playwright ──────────────────────────────
     async with async_playwright() as pw:
-
         browser = await pw.chromium.launch(
+            headless=True,
             args=[
                 "--no-sandbox",
-                # ^ Obligatoire dans les conteneurs Docker
                 "--disable-setuid-sandbox",
-                # ^ Idem
                 "--disable-dev-shm-usage",
-                # ^ Évite les crashs mémoire dans Docker
             ]
         )
-
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 800}
-            # ^ On crée un contexte (= profil isolé) pour gérer la session
+            viewport={"width": 1280, "height": 800},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
         )
-
         page = await context.new_page()
 
+        # Stealth appliqué avant toute navigation
+        # Masque les indicateurs headless → bypass bot detection WorkOS
+        await stealth_async(page)
+
         if authenticated:
-            # Se connecter à Dust avant de visiter l'URL cible
-            # Après login, le cookie de session est actif dans tout le contexte
+            # Login Dust avant de visiter l'URL cible
             await login_to_dust(page)
 
-        # Naviguer vers l'URL cible (avec ou sans auth)
+        # Naviguer vers l'URL cible
         await page.goto(url, wait_until="networkidle", timeout=30_000)
-        # ^ wait_until="networkidle" : attend que la page soit entièrement chargée
-        # ^ timeout=30_000 : abandonne après 30 secondes
-
-        # Capturer la page entière (défilement inclus)
         screenshot_bytes = await page.screenshot(full_page=True)
 
         await browser.close()
-        # ^ Libère la mémoire — important sur Railway
 
     # ── 3. Upload GCS ─────────────────────────────────────────
     client = get_gcs_client()
     bucket = client.bucket(GCP_BUCKET_NAME)
     blob   = bucket.blob(blob_name)
     blob.upload_from_string(screenshot_bytes, content_type="image/png")
-    # ^ Envoie les bytes PNG vers GCS avec le bon Content-Type
 
     # ── 4. URL publique ───────────────────────────────────────
     public_url = f"https://storage.googleapis.com/{GCP_BUCKET_NAME}/{blob_name}"
-    # ^ Construction directe de l'URL publique GCS
-    # ^ Fonctionne si le bucket a "allUsers → Storage Object Viewer" dans son IAM
-
     return public_url
-    # ^ Cette URL est retournée à l'agent Dust comme output du tool
 
 
 # =============================================================================
@@ -192,8 +187,7 @@ async def screenshot_url(url: str, authenticated: bool = False) -> str:
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """
-    Intercepte chaque requête HTTP entrante.
-    Vérifie la présence du bon token dans le header Authorization.
+    Vérifie le header Authorization sur chaque requête entrante.
     Retourne 401 si le token est absent ou incorrect.
     """
     async def dispatch(self, request, call_next):
@@ -211,14 +205,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 if __name__ == "__main__":
     print(f"🚀 Serveur MCP Screenshot démarré sur le port {PORT}")
     print(f"🔐 Auth MCP  : {'Activée' if MCP_BEARER_TOKEN else 'DÉSACTIVÉE ⚠️'}")
-    print(f"🔑 Dust auth : {'Configurée' if DUST_EMAIL else 'Non configurée'}")
+    print(f"🔑 Dust auth : {'Configurée ({DUST_EMAIL})' if DUST_EMAIL else 'Non configurée'}")
 
     app = mcp.streamable_http_app()
-    # ^ App ASGI FastMCP en mode StreamableHTTP (supporté par Dust)
-
     app.add_middleware(BearerAuthMiddleware)
-    # ^ Middleware d'auth injecté par-dessus l'app MCP
 
     uvicorn.run(app, host="0.0.0.0", port=PORT)
-    # ^ host="0.0.0.0" obligatoire sur Railway
-    # ^ PORT injecté automatiquement par Railway
