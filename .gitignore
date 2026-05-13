@@ -1,0 +1,20 @@
+# Variables d'environnement — contient les secrets (JAMAIS sur GitHub)
+.env
+.env.*
+
+# Fichiers de credentials GCP téléchargés depuis la console Google
+*.json
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environnements virtuels locaux
+.venv/
+venv/
+env/
+
+# Fichiers systèmes
+.DS_Store
+Thumbs.db
