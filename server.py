@@ -13,7 +13,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from playwright_stealth import Stealth
 from google.cloud import storage
 from google.oauth2 import service_account
 
@@ -34,7 +34,8 @@ from config import (
 def get_gcs_client() -> storage.Client:
     """
     Retourne un client GCS authentifié.
-    Lit les credentials depuis la variable d'env GCP_CREDENTIALS_JSON.
+    Lit les credentials depuis la variable d'env GCP_CREDENTIALS_JSON
+    (JSON du service account GCP, stringifié en une seule ligne).
     """
     if GCP_CREDENTIALS_JSON:
         info  = json.loads(GCP_CREDENTIALS_JSON)
@@ -71,15 +72,19 @@ async def login_to_dust(page) -> None:
 
     Flow :
       1. dust.tt/api/workos/login → redirige vers signin.dust.tt
-      2. Saisir l'email → cliquer Continuer
-      3. Saisir le mot de passe → cliquer Continuer (1er bouton submit)
-      4. Attendre la redirection vers app.dust.tt
+      2. Saisir l'email → cliquer Continuer (.first car 2 boutons submit)
+      3. Saisir le mot de passe → cliquer Continuer (.first pour éviter passkey)
+      4. Attendre la redirection finale vers app.dust.tt
 
-    Utilise playwright-stealth pour bypasser la détection bot de WorkOS.
+    Utilise playwright-stealth v2 (Stealth) pour bypasser la détection bot WorkOS.
     """
 
-    # Étape 1 : Naviguer vers la page de login Dust
-    # WorkOS redirige automatiquement vers signin.dust.tt
+    # Appliquer le stealth AVANT toute navigation
+    # Masque les indicateurs headless Chromium (navigator.webdriver, plugins, etc.)
+    await Stealth().apply_stealth_async(page)
+
+    # Étape 1 : Naviguer vers le login Dust
+    # dust.tt redirige automatiquement vers signin.dust.tt (WorkOS AuthKit)
     await page.goto(
         "https://dust.tt/api/workos/login?returnTo=%2Fapi%2Flogin",
         wait_until="networkidle",
@@ -91,21 +96,21 @@ async def login_to_dust(page) -> None:
     await page.locator("input[name='email']").wait_for(state="visible", timeout=10_000)
     await page.locator("input[name='email']").fill(DUST_EMAIL)
 
-    # Cliquer sur "Continuer" — .first car il peut y avoir plusieurs boutons submit
     await page.locator("button[type='submit']").first.click()
+    # ^ .first : il y a 2 boutons submit sur la page — on cible le principal
     await page.wait_for_load_state("networkidle")
-    # ^ Après ce clic, WorkOS charge la page mot de passe (signin.dust.tt/password)
+    # ^ WorkOS charge la page mot de passe (signin.dust.tt/password)
 
     # Étape 3 : Saisir le mot de passe
     await page.locator("input[name='password']").wait_for(state="visible", timeout=10_000)
     await page.locator("input[name='password']").fill(DUST_PASSWORD)
 
-    # Cliquer sur "Continuer" — .first pour éviter le bouton passkey
     await page.locator("button[type='submit']").first.click()
+    # ^ .first : évite le bouton "passkey" qui est aussi de type submit
     await page.wait_for_load_state("networkidle")
 
-    # Étape 4 : Attendre la redirection finale vers app.dust.tt
-    # Dust redirige : signin.dust.tt → dust.tt/api/workos/callback → app.dust.tt
+    # Étape 4 : Attendre la redirection finale
+    # WorkOS redirige : signin.dust.tt → dust.tt/api/workos/callback → app.dust.tt
     await page.wait_for_url("https://app.dust.tt/**", timeout=20_000)
     # ^ Session active dans tout le contexte Playwright à partir d'ici
 
@@ -141,9 +146,9 @@ async def screenshot_url(url: str, authenticated: bool = False) -> str:
         browser = await pw.chromium.launch(
             headless=True,
             args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
+                "--no-sandbox",              # Obligatoire dans Docker
+                "--disable-setuid-sandbox",  # Idem
+                "--disable-dev-shm-usage",   # Évite les crashs mémoire dans Docker
             ]
         )
         context = await browser.new_context(
@@ -156,13 +161,13 @@ async def screenshot_url(url: str, authenticated: bool = False) -> str:
         )
         page = await context.new_page()
 
-        # Stealth appliqué avant toute navigation
-        # Masque les indicateurs headless → bypass bot detection WorkOS
-        await stealth_async(page)
-
         if authenticated:
-            # Login Dust avant de visiter l'URL cible
+            # Login Dust avant de naviguer vers l'URL cible
+            # Après login_to_dust(), le cookie de session est actif dans ce contexte
             await login_to_dust(page)
+        else:
+            # Stealth appliqué même sans auth (bonne pratique générale)
+            await Stealth().apply_stealth_async(page)
 
         # Naviguer vers l'URL cible
         await page.goto(url, wait_until="networkidle", timeout=30_000)
@@ -187,7 +192,8 @@ async def screenshot_url(url: str, authenticated: bool = False) -> str:
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """
-    Vérifie le header Authorization sur chaque requête entrante.
+    Intercepte chaque requête HTTP entrante.
+    Vérifie la présence du bon token dans le header Authorization.
     Retourne 401 si le token est absent ou incorrect.
     """
     async def dispatch(self, request, call_next):
@@ -205,9 +211,13 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 if __name__ == "__main__":
     print(f"🚀 Serveur MCP Screenshot démarré sur le port {PORT}")
     print(f"🔐 Auth MCP  : {'Activée' if MCP_BEARER_TOKEN else 'DÉSACTIVÉE ⚠️'}")
-    print(f"🔑 Dust auth : {'Configurée ({DUST_EMAIL})' if DUST_EMAIL else 'Non configurée'}")
+    print(f"🔑 Dust auth : {'Configurée (' + DUST_EMAIL + ')' if DUST_EMAIL else 'Non configurée'}")
 
     app = mcp.streamable_http_app()
+    # ^ App ASGI FastMCP en mode StreamableHTTP (supporté par Dust)
+
     app.add_middleware(BearerAuthMiddleware)
+    # ^ Middleware d'auth par-dessus l'app MCP
 
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+    # ^ host="0.0.0.0" obligatoire sur Railway
